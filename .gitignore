@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+ talk-client/node_modules/
+ talk-client/package-lock.json
