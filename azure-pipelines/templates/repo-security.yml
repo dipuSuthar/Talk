@@ -1,0 +1,30 @@
+# Shared security gates used by BOTH pipelines. Any finding fails the build.
+parameters:
+  - name: workDir      # 'client' or 'server'
+    type: string
+  - name: hasDockerfile
+    type: boolean
+    default: true
+
+steps:
+  # 1. Secrets committed anywhere in the full git history
+  - script: |
+      set -euo pipefail
+      docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:$(gitleaksVersion) \
+        detect --source=/repo --redact --verbose --exit-code 1
+    displayName: 'Secret scan (gitleaks, full history)'
+
+  # 2. Known-vulnerable dependencies + secrets + IaC misconfig in this folder
+  - script: |
+      set -euo pipefail
+      docker run --rm -v "$(Build.SourcesDirectory)/${{ parameters.workDir }}:/src" aquasec/trivy:$(trivyVersion) \
+        fs --scanners vuln,secret,misconfig --ignorefile /src/.trivyignore --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 /src
+    displayName: 'Dependency + misconfig scan (Trivy fs)'
+
+  # 3. Dockerfile best practice / security lint
+  - ${{ if eq(parameters.hasDockerfile, true) }}:
+      - script: |
+          set -euo pipefail
+          docker run --rm -i hadolint/hadolint:$(hadolintVersion) hadolint --failure-threshold warning - \
+            < "${{ parameters.workDir }}/Dockerfile"
+        displayName: 'Dockerfile lint (hadolint)'
