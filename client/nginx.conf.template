@@ -1,0 +1,71 @@
+# Serves the built React app and reverse-proxies API + websockets to the Node server,
+# so the browser only ever talks to ONE origin (no CORS, first-party refresh cookie).
+# ${API_UPSTREAM} / ${API_RESOLVER} are filled in from the container environment at start-up
+# (defaults set in the Dockerfile). The upstream is resolved lazily, so this container still
+# boots when run on its own; API calls just return 502 until the server is reachable.
+server {
+  listen 80;
+  resolver ${API_RESOLVER} valid=10s ipv6=off;
+  set $api_upstream http://${API_UPSTREAM};
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  client_max_body_size 60m;          # a bit above the 50 MB video limit
+  server_tokens off;
+
+  # Security headers (HTML responses). Note: add_header in a location block replaces these, so
+  # only the `/` location (which serves index.html) relies on them.
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-Frame-Options "DENY" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+  # res.cloudinary.com is only for chat media imported from the old v1 app.
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://res.cloudinary.com; media-src 'self' blob: https://res.cloudinary.com; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+
+  gzip on;
+  gzip_types text/css application/javascript application/json image/svg+xml;
+
+  location /api/ {
+    proxy_pass $api_upstream;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;         # slow uploads on mobile networks
+    proxy_send_timeout 300s;
+  }
+
+  location /uploads/ {
+    proxy_pass $api_upstream;
+    proxy_set_header Host $host;
+  }
+
+  location /socket.io/ {
+    proxy_pass $api_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 86400s;
+  }
+
+  # Hashed build assets can be cached forever.
+  location /assets/ {
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+    try_files $uri =404;
+  }
+
+  # Single-page app: unknown paths fall back to index.html (never cache it).
+  location / {
+    add_header Cache-Control "no-cache";
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://res.cloudinary.com; media-src 'self' blob: https://res.cloudinary.com; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+    try_files $uri /index.html;
+  }
+}

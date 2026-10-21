@@ -1,0 +1,44 @@
+# One command to run everything:  cp .env.example .env  (fill the secrets)  &&  docker compose up --build
+# App:  http://localhost:8080
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    # Not published to the host: only the server container can reach it.
+
+  server:
+    build: ./server
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 7000
+      MONGO_URL: mongodb://mongo:27017/talk
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
+      JWT_MEDIA_SECRET: ${JWT_MEDIA_SECRET:?set JWT_MEDIA_SECRET in .env}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:8081}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}   # set true once you serve over HTTPS
+      TRUST_PROXY: 1                           # nginx is one proxy hop in front
+    volumes:
+      - uploads:/data/uploads
+
+  client:
+    build: ./client
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+
+volumes:
+  mongo-data:
+  uploads:
