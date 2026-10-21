@@ -1,8 +1,3 @@
-# Node.js
-# Build a general Node.js project with npm.
-# Add steps that analyze code, save build artifacts, deploy, and more:
-# https://docs.microsoft.com/azure/devops/pipelines/languages/javascript
-
 trigger:
 - main
 
@@ -19,4 +14,11 @@ steps:
     npm install
     npm run build
   displayName: 'npm install and build'
-  workingDirectory: 'client'  # <-- CHANGE THIS to 'client' for your client pipeline, or 'server' for your server pipeline
+  workingDirectory: 'client'  # or 'client'
+
+# ADD THIS TASK BELOW:
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: '$(System.DefaultWorkingDirectory)/server/dist' # Change 'server/dist' to 'server/build' (or 'client/dist') depending on where your build output folder actually is
+    artifactName: 'server-build'
+    publishLocation: 'pipeline'
