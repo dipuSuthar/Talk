@@ -19,6 +19,6 @@ steps:
 # ADD THIS TASK BELOW:
 - task: PublishPipelineArtifact@1
   inputs:
-    targetPath: '$(System.DefaultWorkingDirectory)/server/dist' # Change 'server/dist' to 'server/build' (or 'client/dist') depending on where your build output folder actually is
+    targetPath: '$(System.DefaultWorkingDirectory)/server'
     artifactName: 'server-build'
     publishLocation: 'pipeline'
