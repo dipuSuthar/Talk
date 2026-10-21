@@ -1,0 +1,198 @@
+# Talk SERVER: scan -> test -> SonarQube -> image -> image scan -> staging -> DAST -> production
+# Runs only when something under server/ changes.
+trigger:
+  branches: { include: [main] }
+  paths:    { include: [server/*, azure-pipelines/server-pipeline.yml, azure-pipelines/templates/*] }
+
+# Azure Repos ignores `pr:`. Enforce this pipeline on PRs with a Branch Policy -> Build validation.
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+resources:
+  containers:
+    - container: mongo
+      image: mongo:7
+      ports: ['27017:27017']
+
+variables:
+  # ---- replace these with your own names ----
+  azureConnection: 'azure-service-connection'      # ARM service connection (least privilege, scoped to the RG)
+  acrConnection:   'acr-service-connection'        # Docker Registry service connection
+  sonarConnection: 'sonarqube-service-connection'  # SonarQube service connection
+  acrLoginServer:  'talkregistry.azurecr.io'
+  stagingApp:      'talk-server-staging'
+  prodApp:         'talk-server'
+  stagingUrl:      'https://staging.example.com'   # public staging URL (CDN/Front Door) for the DAST scan
+  # ---- pinned tool versions (bump deliberately, review the changelog) ----
+  gitleaksVersion: 'v8.21.2'
+  trivyVersion:    '0.58.1'
+  hadolintVersion: 'v2.12.0-alpine'
+  image: '$(acrLoginServer)/talk-server:$(Build.BuildId)'
+
+stages:
+  # ------------------------------------------------------------------ 1
+  - stage: Quality
+    displayName: Security + tests + SonarQube
+    jobs:
+      - job: scan
+        services: { mongo: mongo }
+        steps:
+          - checkout: self
+            fetchDepth: 0               # full history for the secret scan
+            persistCredentials: false   # don't leave the repo token on the agent
+
+          - template: templates/repo-security.yml
+            parameters: { workDir: server }
+
+          - task: NodeTool@0
+            inputs: { versionSpec: '22.x' }
+
+          # --ignore-scripts: a compromised dependency can't run code during install
+          - script: npm ci --ignore-scripts
+            workingDirectory: server
+            displayName: 'Install (no lifecycle scripts)'
+
+          - script: npm audit --omit=dev --audit-level=high
+            workingDirectory: server
+            displayName: 'npm audit (high+)'
+
+          - task: SonarQubePrepare@7
+            displayName: 'SonarQube: prepare'
+            inputs:
+              SonarQube: $(sonarConnection)
+              scannerMode: cli
+              configMode: file
+              configFile: server/sonar-project.properties
+              extraProperties: |
+                sonar.projectBaseDir=$(Build.SourcesDirectory)/server
+                sonar.qualitygate.wait=true
+                sonar.qualitygate.timeout=300
+
+          # Runs against the real MongoDB service container, so the concurrent
+          # view-once race test executes too (it is skipped on non-MongoDB stand-ins).
+          - script: |
+              set -euo pipefail
+              mkdir -p coverage
+              node --test --test-concurrency=1 --experimental-test-coverage \
+                --test-reporter=spec  --test-reporter-destination=stdout \
+                --test-reporter=junit --test-reporter-destination=coverage/junit.xml \
+                --test-reporter=lcov  --test-reporter-destination=coverage/lcov.info \
+                test/*.test.js
+            workingDirectory: server
+            displayName: 'Tests + coverage'
+            env:
+              MONGO_URL: 'mongodb://localhost:27017/talk_test'
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: server/coverage/junit.xml
+              testRunTitle: 'Talk server'
+
+          # Fails the build if the SonarQube quality gate fails (sonar.qualitygate.wait=true)
+          - task: SonarQubeAnalyze@7
+            displayName: 'SonarQube: analyze + quality gate'
+
+  # ------------------------------------------------------------------ 2
+  - stage: Image
+    displayName: Build, scan and push image
+    dependsOn: Quality
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: image
+        steps:
+          - checkout: self
+            persistCredentials: false
+
+          - task: Docker@2
+            displayName: 'Build image'
+            inputs:
+              command: build
+              containerRegistry: $(acrConnection)
+              repository: talk-server
+              dockerfile: server/Dockerfile
+              buildContext: server
+              tags: $(Build.BuildId)
+
+          # Scan BEFORE pushing: a vulnerable image never reaches the registry
+          - script: |
+              set -euo pipefail
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:$(trivyVersion) \
+                image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$(image)"
+            displayName: 'Image scan (Trivy, fails on HIGH/CRITICAL)'
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                -v "$(Build.ArtifactStagingDirectory)/sbom:/out" aquasec/trivy:$(trivyVersion) \
+                image --format cyclonedx --output /out/server-sbom.cdx.json "$(image)"
+            displayName: 'Generate SBOM (CycloneDX)'
+
+          - publish: $(Build.ArtifactStagingDirectory)/sbom
+            artifact: sbom-server
+
+          - task: Docker@2
+            displayName: 'Push image'
+            inputs:
+              command: push
+              containerRegistry: $(acrConnection)
+              repository: talk-server
+              tags: $(Build.BuildId)
+
+  # ------------------------------------------------------------------ 3
+  - stage: Staging
+    displayName: Deploy to staging + DAST
+    dependsOn: Image
+    jobs:
+      - deployment: staging
+        environment: talk-staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  inputs:
+                    azureSubscription: $(azureConnection)
+                    appName: $(stagingApp)
+                    containers: $(image)
+
+      - job: dast
+        dependsOn: staging
+        steps:
+          # OWASP ZAP baseline = passive scan of the running staging site (headers, cookies, info leaks)
+          - script: |
+              mkdir -p "$(Build.ArtifactStagingDirectory)/zap" && chmod 777 "$(Build.ArtifactStagingDirectory)/zap"
+              docker run --rm -v "$(Build.ArtifactStagingDirectory)/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py -t "$(stagingUrl)" -r zap-report.html -J zap-report.json -I
+            displayName: 'DAST (OWASP ZAP baseline)'
+          - publish: $(Build.ArtifactStagingDirectory)/zap
+            artifact: zap-server
+            condition: always()
+
+  # ------------------------------------------------------------------ 4
+  - stage: Production
+    displayName: Deploy to production (manual approval)
+    dependsOn: Staging
+    jobs:
+      - deployment: production
+        environment: talk-production        # add Approvals & checks on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  inputs:
+                    azureSubscription: $(azureConnection)
+                    appName: $(prodApp)
+                    containers: $(image)
+                - script: |
+                    for i in 1 2 3 4 5 6; do
+                      curl -fsS "https://$(prodApp).azurewebsites.net/health" && exit 0
+                      sleep 10
+                    done
+                    echo "Health check failed after deploy"; exit 1
+                  displayName: 'Post-deploy health check'

@@ -1,0 +1,158 @@
+# Talk CLIENT (static site): scan -> lint -> SonarQube -> build -> staging -> DAST -> production
+# Runs only when something under client/ changes.
+trigger:
+  branches: { include: [main] }
+  paths:    { include: [client/*, azure-pipelines/client-pipeline.yml, azure-pipelines/templates/*] }
+
+pr: none   # use a Branch Policy -> Build validation for pull requests on Azure Repos
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # ---- replace these with your own names ----
+  azureConnection:   'azure-service-connection'
+  sonarConnection:   'sonarqube-service-connection'
+  stagingStorage:    'talkstaticstaging'       # storage account with "Static website" enabled
+  prodStorage:       'talkstatic'
+  stagingUrl:        'https://staging.example.com'
+  frontDoorRG:       'talk-rg'
+  frontDoorProfile:  'talk-afd'
+  frontDoorEndpoint: 'talk-endpoint'
+  # ---- pinned tool versions ----
+  gitleaksVersion: 'v8.21.2'
+  trivyVersion:    '0.58.1'
+  hadolintVersion: 'v2.12.0-alpine'
+
+stages:
+  - stage: Quality
+    displayName: Security + lint + SonarQube + build
+    jobs:
+      - job: build
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            persistCredentials: false
+
+          - template: templates/repo-security.yml
+            parameters: { workDir: client }
+
+          - task: NodeTool@0
+            inputs: { versionSpec: '22.x' }
+
+          - script: npm ci --ignore-scripts
+            workingDirectory: client
+            displayName: 'Install (no lifecycle scripts)'
+
+          - script: npm audit --omit=dev --audit-level=high
+            workingDirectory: client
+            displayName: 'npm audit (high+)'
+
+          - task: SonarQubePrepare@7
+            displayName: 'SonarQube: prepare'
+            inputs:
+              SonarQube: $(sonarConnection)
+              scannerMode: cli
+              configMode: file
+              configFile: client/sonar-project.properties
+              extraProperties: |
+                sonar.projectBaseDir=$(Build.SourcesDirectory)/client
+                sonar.qualitygate.wait=true
+                sonar.qualitygate.timeout=300
+
+          - script: npm run lint
+            workingDirectory: client
+            displayName: 'ESLint'
+
+          - script: npm run build
+            workingDirectory: client
+            displayName: 'Production build'
+
+          - task: SonarQubeAnalyze@7
+            displayName: 'SonarQube: analyze + quality gate'
+
+          # Guard: the shipped bundle must not contain source maps or obvious secrets
+          - script: |
+              set -euo pipefail
+              if find client/dist -name '*.map' | grep -q .; then echo "Source maps found in dist"; exit 1; fi
+              if grep -rEl "(JWT_[A-Z_]*SECRET|BEGIN (RSA |EC )?PRIVATE KEY)" client/dist; then echo "Secret-looking string in dist"; exit 1; fi
+            displayName: 'Bundle hygiene check'
+
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/sbom"
+              docker run --rm -v "$(Build.SourcesDirectory)/client:/src" -v "$(Build.ArtifactStagingDirectory)/sbom:/out" \
+                aquasec/trivy:$(trivyVersion) fs --format cyclonedx --output /out/client-sbom.cdx.json /src
+            displayName: 'Generate SBOM (CycloneDX)'
+
+          - publish: $(Build.ArtifactStagingDirectory)/sbom
+            artifact: sbom-client
+          - publish: client/dist
+            artifact: dist
+
+  - stage: Staging
+    displayName: Deploy to staging + DAST
+    dependsOn: Quality
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: staging
+        environment: talk-staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: dist
+                - task: AzureCLI@2
+                  displayName: 'Upload to staging storage'
+                  inputs:
+                    azureSubscription: $(azureConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      D="$(Pipeline.Workspace)/dist"
+                      az storage blob upload-batch --account-name $(stagingStorage) --auth-mode login -d '$web' -s "$D" --overwrite \
+                        --content-cache-control "public,max-age=31536000,immutable"
+                      az storage blob upload --account-name $(stagingStorage) --auth-mode login -c '$web' -f "$D/index.html" -n index.html --overwrite \
+                        --content-cache-control "no-cache"
+
+      - job: dast
+        dependsOn: staging
+        steps:
+          - script: |
+              mkdir -p "$(Build.ArtifactStagingDirectory)/zap" && chmod 777 "$(Build.ArtifactStagingDirectory)/zap"
+              docker run --rm -v "$(Build.ArtifactStagingDirectory)/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+                zap-baseline.py -t "$(stagingUrl)" -r zap-report.html -J zap-report.json -I
+            displayName: 'DAST (OWASP ZAP baseline)'
+          - publish: $(Build.ArtifactStagingDirectory)/zap
+            artifact: zap-client
+            condition: always()
+
+  - stage: Production
+    displayName: Deploy to production (manual approval)
+    dependsOn: Staging
+    jobs:
+      - deployment: production
+        environment: talk-production        # add Approvals & checks on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: dist
+                - task: AzureCLI@2
+                  displayName: 'Upload to production storage + purge CDN'
+                  inputs:
+                    azureSubscription: $(azureConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      D="$(Pipeline.Workspace)/dist"
+                      az storage blob upload-batch --account-name $(prodStorage) --auth-mode login -d '$web' -s "$D" --overwrite \
+                        --content-cache-control "public,max-age=31536000,immutable"
+                      az storage blob upload --account-name $(prodStorage) --auth-mode login -c '$web' -f "$D/index.html" -n index.html --overwrite \
+                        --content-cache-control "no-cache"
+                      az afd endpoint purge -g $(frontDoorRG) --profile-name $(frontDoorProfile) \
+                        --endpoint-name $(frontDoorEndpoint) --content-paths '/index.html' --domains ''
