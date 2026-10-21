@@ -19,3 +19,4 @@ steps:
     npm install
     npm run build
   displayName: 'npm install and build'
+  workingDirectory: 'client'  # <-- CHANGE THIS to 'client' for your client pipeline, or 'server' for your server pipeline
